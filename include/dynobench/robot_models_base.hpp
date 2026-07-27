@@ -86,6 +86,10 @@ struct Obstacle {
   std::string type;
   Eigen::VectorXd size;
   Eigen::VectorXd center;
+  Eigen::VectorXd p0;
+  Eigen::VectorXd p1;
+  std::vector<Eigen::VectorXd> points;
+  double radius = 0.;
 };
 
 using Transform3d = Eigen::Transform<double, 3, Eigen::Isometry>;

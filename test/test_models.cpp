@@ -802,6 +802,64 @@ BOOST_AUTO_TEST_CASE(tcol_unicycle) {
   BOOST_CHECK(std::fabs(col.distance - (-0.11123)) < 1e-5);
 }
 
+BOOST_AUTO_TEST_CASE(t_grace_obstacle_and_model_compatibility) {
+  const YAML::Node env = YAML::Load(R"yaml(
+environment:
+  min: [-3, -3]
+  max: [3, 3]
+  obstacles:
+    - {type: box, center: [2, 2], size: [0.2, 0.2]}
+    - {type: circle, center: [-2, 2], radius: 0.2}
+    - {type: capsule, p0: [-2, -2], p1: [-1, -2], radius: 0.2}
+    - type: polygon
+      points: [[1, 1], [-1, -1], [0, 0], [-1, 1], [1, -1]]
+robots:
+  - type: double_integrator_0
+    start: [0, 0, 0, 0]
+    goal: [2.5, -2.5, 0, 0]
+)yaml");
+
+  Problem problem;
+  BOOST_REQUIRE_NO_THROW(problem.read_from_yaml(env));
+  BOOST_REQUIRE_EQUAL(problem.obstacles.size(), 4);
+  BOOST_TEST(problem.obstacles[0].type == "box");
+  BOOST_TEST(problem.obstacles[1].type == "sphere");
+  BOOST_TEST(problem.obstacles[2].type == "capsule");
+  BOOST_TEST(problem.obstacles[3].type == "polygon");
+
+  const auto models_dir =
+      std::filesystem::path(__FILE__).parent_path().parent_path() / "models";
+  const std::vector<std::string> grace_model_names = {
+      "unicycle_first_order_0.yaml",
+      "unicycle_first_order_0_sphere.yaml",
+      "unicycle_second_order_0.yaml",
+      "car_first_order_with_1_trailers_0.yaml"};
+  for (const auto &model_name : grace_model_names) {
+    BOOST_CHECK_NO_THROW(
+        robot_factory((models_dir / model_name).c_str(), problem.p_lb,
+                      problem.p_ub));
+  }
+
+  auto robot = robot_factory(
+      (models_dir / "double_integrator_0.yaml").c_str(), problem.p_lb,
+      problem.p_ub);
+  load_env(*robot, problem);
+  BOOST_REQUIRE_EQUAL(robot->obstacles.size(), 6);
+
+  CollisionOut collision;
+  Eigen::Vector4d state(0., 0., 0., 0.);
+  robot->collision_distance(state, collision);
+  BOOST_TEST(collision.distance < 0.);
+
+  state << -1.5, -2., 0., 0.;
+  robot->collision_distance(state, collision);
+  BOOST_TEST(collision.distance < 0.);
+
+  state << 2.5, -2.5, 0., 0.;
+  robot->collision_distance(state, collision);
+  BOOST_TEST(collision.distance > 0.);
+}
+
 BOOST_AUTO_TEST_CASE(col_car_with_trailer) {
 
   auto env = std::string(base_path) + "envs/car1_v0/bugtrap_0.yaml";

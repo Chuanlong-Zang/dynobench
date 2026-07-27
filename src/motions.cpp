@@ -16,6 +16,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "Eigen/Core"
+#include "Eigen/Geometry"
 #include "dynobench/dyno_macros.hpp"
 
 #include <fcl/fcl.h>
@@ -26,6 +27,7 @@
 #include "fcl/broadphase/broadphase_collision_manager.h"
 #include "fcl/broadphase/broadphase_dynamic_AABB_tree.h"
 #include "fcl/broadphase/default_broadphase_callbacks.h"
+#include "fcl/geometry/shape/convex.h"
 #include "fcl/geometry/shape/box.h"
 #include "fcl/geometry/shape/sphere.h"
 
@@ -44,6 +46,72 @@ using V3d = Eigen::Vector3d;
 using V4d = Eigen::Vector4d;
 using Vxd = Eigen::VectorXd;
 using V1d = Eigen::Matrix<double, 1, 1>;
+
+namespace {
+
+double cross_2d(const V2d &origin, const V2d &a, const V2d &b) {
+  const V2d oa = a - origin;
+  const V2d ob = b - origin;
+  return oa.x() * ob.y() - oa.y() * ob.x();
+}
+
+std::vector<V2d>
+convex_hull_2d(const std::vector<Eigen::VectorXd> &polygon_points) {
+  std::vector<V2d> points;
+  points.reserve(polygon_points.size());
+  for (const auto &point : polygon_points) {
+    if (point.size() < 2) {
+      throw std::runtime_error(
+          "Polygon obstacle points require at least two coordinates.");
+    }
+    if (!std::isfinite(point(0)) || !std::isfinite(point(1))) {
+      throw std::runtime_error(
+          "Polygon obstacle points require finite coordinates.");
+    }
+    points.emplace_back(point(0), point(1));
+  }
+
+  std::sort(points.begin(), points.end(), [](const V2d &a, const V2d &b) {
+    return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y());
+  });
+  points.erase(std::unique(points.begin(), points.end(),
+                           [](const V2d &a, const V2d &b) {
+                             return a.x() == b.x() && a.y() == b.y();
+                           }),
+               points.end());
+
+  if (points.size() < 3) {
+    throw std::runtime_error(
+        "Polygon obstacle requires at least three unique points.");
+  }
+
+  std::vector<V2d> hull(2 * points.size());
+  size_t hull_size = 0;
+  for (const auto &point : points) {
+    while (hull_size >= 2 &&
+           cross_2d(hull[hull_size - 2], hull[hull_size - 1], point) <= 0.) {
+      --hull_size;
+    }
+    hull[hull_size++] = point;
+  }
+
+  const size_t lower_size = hull_size + 1;
+  for (auto it = points.rbegin() + 1; it != points.rend(); ++it) {
+    while (hull_size >= lower_size &&
+           cross_2d(hull[hull_size - 2], hull[hull_size - 1], *it) <= 0.) {
+      --hull_size;
+    }
+    hull[hull_size++] = *it;
+  }
+
+  hull.resize(hull_size - 1);
+  if (hull.size() < 3) {
+    throw std::runtime_error("Polygon obstacle has zero area.");
+  }
+  return hull;
+}
+
+} // namespace
 
 // using namespace pinocchio;
 // using namespace crocoddyl;
@@ -260,17 +328,72 @@ void Problem::read_from_yaml(const YAML::Node &env) {
   p_lb = Eigen::Map<Eigen::VectorXd>(&min_.at(0), min_.size());
   p_ub = Eigen::Map<Eigen::VectorXd>(&max_.at(0), max_.size());
 
-  for (const auto &obs : env["environment"]["obstacles"]) {
-    std::vector<double> size_ = obs["size"].as<std::vector<double>>();
-    Vxd size = Vxd::Map(size_.data(), size_.size());
+  obstacles.clear();
+  const auto obstacle_nodes = env["environment"]["obstacles"];
+  if (obstacle_nodes && !obstacle_nodes.IsSequence()) {
+    throw std::runtime_error("'environment.obstacles' must be a sequence.");
+  }
+  if (obstacle_nodes) {
+    for (const auto &obs : obstacle_nodes) {
+      const auto type_node = obs["type"];
+      if (!type_node || !type_node.IsScalar()) {
+        throw std::runtime_error("Obstacle is missing a scalar 'type'.");
+      }
 
-    auto obs_type = obs["type"].as<std::string>();
+      const std::string obs_type = type_node.as<std::string>();
+      Obstacle obstacle;
 
-    std::vector<double> center_ = obs["center"].as<std::vector<double>>();
-    Vxd center = Vxd::Map(center_.data(), center_.size());
+      if (obs_type == "box") {
+        const auto size_ = obs["size"].as<std::vector<double>>();
+        const auto center_ = obs["center"].as<std::vector<double>>();
+        obstacle.type = obs_type;
+        obstacle.size = Vxd::Map(size_.data(), size_.size());
+        obstacle.center = Vxd::Map(center_.data(), center_.size());
+      } else if (obs_type == "circle" || obs_type == "sphere") {
+        const auto center_ = obs["center"].as<std::vector<double>>();
+        obstacle.type = "sphere";
+        obstacle.center = Vxd::Map(center_.data(), center_.size());
+        obstacle.size.resize(1);
+        if (const auto radius_node = obs["radius"]; radius_node) {
+          obstacle.size(0) = radius_node.as<double>();
+        } else {
+          const auto size_ = obs["size"].as<std::vector<double>>();
+          if (size_.empty()) {
+            throw std::runtime_error(
+                "Sphere obstacle requires a non-empty 'size' or 'radius'.");
+          }
+          obstacle.size(0) = size_.front();
+        }
+      } else if (obs_type == "capsule") {
+        const auto p0_ = obs["p0"].as<std::vector<double>>();
+        const auto p1_ = obs["p1"].as<std::vector<double>>();
+        obstacle.type = obs_type;
+        obstacle.p0 = Vxd::Map(p0_.data(), p0_.size());
+        obstacle.p1 = Vxd::Map(p1_.data(), p1_.size());
+        obstacle.radius = obs["radius"].as<double>();
+      } else if (obs_type == "polygon") {
+        const auto point_nodes = obs["points"];
+        if (!point_nodes || !point_nodes.IsSequence() ||
+            point_nodes.size() < 3) {
+          throw std::runtime_error(
+              "Polygon obstacle requires at least three points.");
+        }
+        obstacle.type = obs_type;
+        obstacle.points.reserve(point_nodes.size());
+        for (const auto &point_node : point_nodes) {
+          const auto point = point_node.as<std::vector<double>>();
+          if (point.size() < 2) {
+            throw std::runtime_error(
+                "Polygon obstacle points require at least two coordinates.");
+          }
+          obstacle.points.push_back(Vxd::Map(point.data(), point.size()));
+        }
+      } else {
+        throw std::runtime_error("Unknown obstacle type: " + obs_type);
+      }
 
-    obstacles.push_back(
-        Obstacle{.type = obs_type, .size = size, .center = center});
+      obstacles.push_back(std::move(obstacle));
+    }
   }
 
   robotType = env["robots"][0]["type"].as<std::string>();
@@ -657,9 +780,9 @@ void load_env(Model_robot &robot, const Problem &problem) {
   double ref_pos = 0;
   double ref_size = 1.;
   for (const auto &obs : problem.obstacles) {
-    auto &obs_type = obs.type;
-    auto &size = obs.size;
-    auto &center = obs.center;
+    const auto &obs_type = obs.type;
+    const auto &size = obs.size;
+    const auto &center = obs.center;
 
     if (obs_type == "box") {
       std::shared_ptr<fcl::CollisionGeometryd> geom;
@@ -678,8 +801,99 @@ void load_env(Model_robot &robot, const Problem &problem) {
           center(0), center(1), center.size() == 3 ? center(2) : ref_pos));
       co->computeAABB();
       robot.obstacles.push_back(co);
+    } else if (obs_type == "capsule") {
+      if (obs.p0.size() < 2 || obs.p1.size() < 2 || obs.radius <= 0.) {
+        throw std::runtime_error(
+            "Capsule obstacle requires p0, p1, and a positive radius.");
+      }
+
+      const double p0x = obs.p0(0);
+      const double p0y = obs.p0(1);
+      const double p1x = obs.p1(0);
+      const double p1y = obs.p1(1);
+      const double dx = p1x - p0x;
+      const double dy = p1y - p0y;
+      const double length = std::hypot(dx, dy);
+
+      if (length < 1e-9) {
+        auto geom = std::make_shared<fcl::Sphered>(obs.radius);
+        auto co = new fcl::CollisionObjectd(geom);
+        co->setTranslation(fcl::Vector3d(p0x, p0y, ref_pos));
+        co->computeAABB();
+        robot.obstacles.push_back(co);
+        continue;
+      }
+
+      auto shaft_geom =
+          std::make_shared<fcl::Boxd>(length, 2. * obs.radius, ref_size);
+      auto shaft = new fcl::CollisionObjectd(shaft_geom);
+      shaft->setRotation(
+          Eigen::AngleAxisd(std::atan2(dy, dx), Eigen::Vector3d::UnitZ())
+              .toRotationMatrix());
+      shaft->setTranslation(
+          fcl::Vector3d(.5 * (p0x + p1x), .5 * (p0y + p1y), ref_pos));
+      shaft->computeAABB();
+      robot.obstacles.push_back(shaft);
+
+      auto cap_geom = std::make_shared<fcl::Sphered>(obs.radius);
+      auto cap0 = new fcl::CollisionObjectd(cap_geom);
+      cap0->setTranslation(fcl::Vector3d(p0x, p0y, ref_pos));
+      cap0->computeAABB();
+      robot.obstacles.push_back(cap0);
+
+      auto cap1 = new fcl::CollisionObjectd(cap_geom);
+      cap1->setTranslation(fcl::Vector3d(p1x, p1y, ref_pos));
+      cap1->computeAABB();
+      robot.obstacles.push_back(cap1);
+    } else if (obs_type == "polygon") {
+      if (obs.points.size() < 3) {
+        throw std::runtime_error(
+            "Polygon obstacle requires at least three points.");
+      }
+
+      const auto hull = convex_hull_2d(obs.points);
+      const int num_points = static_cast<int>(hull.size());
+      const double half_height = .5 * ref_size;
+
+      auto vertices = std::make_shared<std::vector<fcl::Vector3d>>();
+      vertices->reserve(2 * hull.size());
+      for (const auto &point : hull) {
+        vertices->emplace_back(point.x(), point.y(), -half_height);
+      }
+      for (const auto &point : hull) {
+        vertices->emplace_back(point.x(), point.y(), half_height);
+      }
+
+      auto faces = std::make_shared<std::vector<int>>();
+      faces->reserve(2 * (num_points + 1) + 5 * num_points);
+
+      faces->push_back(num_points);
+      faces->push_back(0);
+      for (int i = num_points - 1; i > 0; --i) {
+        faces->push_back(i);
+      }
+
+      faces->push_back(num_points);
+      for (int i = 0; i < num_points; ++i) {
+        faces->push_back(num_points + i);
+      }
+
+      for (int i = 0; i < num_points; ++i) {
+        const int next = (i + 1) % num_points;
+        faces->push_back(4);
+        faces->push_back(i);
+        faces->push_back(next);
+        faces->push_back(num_points + next);
+        faces->push_back(num_points + i);
+      }
+
+      auto geom = std::make_shared<fcl::Convexd>(
+          vertices, num_points + 2, faces, true);
+      auto co = new fcl::CollisionObjectd(geom);
+      co->computeAABB();
+      robot.obstacles.push_back(co);
     } else {
-      throw std::runtime_error("Unknown obstacle type! --" + obs_type);
+      throw std::runtime_error("Unknown obstacle type: " + obs_type);
     }
   }
   robot.env.reset(new fcl::DynamicAABBTreeCollisionManagerd());
